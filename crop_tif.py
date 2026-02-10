@@ -1,40 +1,14 @@
-from PIL import Image
-
-# 打开 TIF 影像
-input_path = "data/test/pic.tif"  # 输入 TIF 文件路径
-output_path = "data/test/pic_resize.tif"  # 输出 TIF 文件路径
-
-# 读取图像
-image = Image.open(input_path)
-
-# 获取图像尺寸
-width, height = image.size
-print(width,height)
-
-# 指定截取区域的像素大小
-#crop_width = 600  # 横轴 100 像素
-#crop_height = 600  # 纵轴 100 像素
-
-# 计算左下角区域的坐标
-'''left = 0
-right = crop_width + left
-top = height - crop_height
-bottom = height'''
-left = 0
-right = 50
-top = 70
-bottom = 120
-
-# 检查是否超出图像边界
-if right > width or bottom > height:
-    raise ValueError("指定的截取区域超出图像边界！")
-
-# 截取左下角指定区域
-cropped_image = image.crop((left, top, right, bottom))
-
-# 保存新图像
-cropped_image.save(output_path, format="TIFF")
-
-# 关闭图像
-image.close()
-cropped_image.close()
+import cv2
+import os
+def crop_image(img_path, mask_path, output_dir, size=512):
+    img = cv2.imread(img_path)
+    mask = cv2.imread(mask_path, 0)
+    h, w = img.shape[:2]
+    for i in range(0, h, size):
+        for j in range(0, w, size):
+            crop_img = img[i:i+size, j:j+size]
+            crop_mask = mask[i:i+size, j:j+size]
+            if crop_img.shape[:2] == (size, size):  # 忽略边缘小块
+                cv2.imwrite(os.path.join(output_dir, 'images', f'crop_{i}_{j}.tif'), crop_img)
+                cv2.imwrite(os.path.join(output_dir, 'masks', f'crop_{i}_{j}.tif'), crop_mask)
+crop_image('D:\\temp\\paper\\data\\LandCover.ai\\5\\test1\\swiss_IMG_8766.JPG', 'D:\\temp\\paper\\data\\LandCover.ai\\5\\test1\\swiss_IMG_8766.png', 'D:\\temp\\paper\\data\\LandCover.ai\\5',size=600)
