@@ -11,12 +11,15 @@ import cv2
 import random
 from common import *
 import os
+import re
+import argparse
 
 # 设置环境变量，限制 OpenMP 线程数以避免多线程冲突
 os.environ["OMP_NUM_THREADS"] = "1"
 
 class TerrainSegmenter:
-    def __init__(self, model_type="vit_h", checkpoint="sam_vit_h_4b8939.pth"):
+    #def __init__(self, model_type="vit_h", checkpoint="sam_vit_h_4b8939.pth"):
+    def __init__(self, model_type="vit_l", checkpoint="sam_vit_l_0b3195.pth"):
         """
         初始化地物分割器，加载 Segment Anything Model (SAM)。
         
@@ -51,7 +54,7 @@ class TerrainSegmenter:
         )
         return list(zip(masks, scores))
 
-    def extract_features(self, image):
+    def extract_features(self, image, drop_spectral=False, drop_ndvi=False, drop_texture=False, drop_edges=False):
         """
         从输入影像中提取多种特征，包括光谱、植被指数、纹理和边缘特征。
         
@@ -64,12 +67,12 @@ class TerrainSegmenter:
         features = {}
         
         # 1. 提取光谱特征（原始波段）
-        if len(image.shape) == 3:  # 确保是多光谱或 RGB 影像
+        if (not drop_spectral) and len(image.shape) == 3:  # 确保是多光谱或 RGB 影像
             for b in range(min(3, image.shape[2])):  # 提取前 3 个波段
                 features[f'spectral_band_{b}'] = image[:, :, b]
         
         # 2. 计算植被指数（NDVI），需有近红外和红波段
-        if image.shape[2] >= 4:  # 假设第 3 通道为近红外，第 2 通道为红波段
+        if (not drop_ndvi) and image.shape[2] >= 4:  # 假设第 3 通道为近红外，第 2 通道为红波段
             nir = image[:, :, 3].astype(float)
             red = image[:, :, 2].astype(float)
             with np.errstate(divide='ignore', invalid='ignore'):
@@ -85,14 +88,16 @@ class TerrainSegmenter:
             gray = image
         
         # 4. 计算局部二值模式（LBP）纹理特征
-        radius = 3  # LBP 半径
-        n_points = 8 * radius  # 采样点数
-        lbp = local_binary_pattern(gray, n_points, radius, method='uniform')
-        features['lbp'] = lbp
+        if not drop_texture:
+            radius = 3  # LBP 半径
+            n_points = 8 * radius  # 采样点数
+            lbp = local_binary_pattern(gray, n_points, radius, method='uniform')
+            features['lbp'] = lbp
         
         # 5. 提取边缘特征（Canny 边缘检测）
-        edges = cv2.Canny(gray.astype(np.uint8), 100, 200)  # 阈值 100 和 200
-        features['edges'] = edges
+        if not drop_edges:
+            edges = cv2.Canny(gray.astype(np.uint8), 100, 200)  # 阈值 100 和 200
+            features['edges'] = edges
     
         return features
 
@@ -122,7 +127,7 @@ class TerrainSegmenter:
         else:
             return result
     
-    def find_pixel(self, points, image):
+    def find_pixel(self, points, image, feature_ablation=None):
         """
         基于影像特征和空间约束选择与提示点特征相似的点，用于增强 SAM 分割。
         
@@ -134,10 +139,10 @@ class TerrainSegmenter:
             优化后的提示点坐标列表。
         """
         # 使用默认权重调用特征引导采样
-        points = self._feature_guided_sampling(points, image)
+        points = self._feature_guided_sampling(points, image, feature_ablation=feature_ablation)
         return points
 
-    def _feature_guided_sampling(self, points, image, select_number=20, feature_weights=None, max_radius=5):
+    def _feature_guided_sampling(self, points, image, select_number=20, feature_weights=None, max_radius=5, feature_ablation=None):
         """
         基于影像特征和空间约束选择与提示点特征相似的点。
         
@@ -152,7 +157,18 @@ class TerrainSegmenter:
             优化后的提示点坐标列表，格式为 [(x1, y1), (x2, y2), ...]。
         """
         # 提取影像特征
-        features = self.extract_features(image)
+        if feature_ablation is None:
+            feature_ablation = {}
+        features = self.extract_features(
+            image,
+            drop_spectral=bool(feature_ablation.get('drop_spectral', False)),
+            drop_ndvi=bool(feature_ablation.get('drop_ndvi', False)),
+            drop_texture=bool(feature_ablation.get('drop_texture', False)),
+            drop_edges=bool(feature_ablation.get('drop_edges', False)),
+        )
+
+        if not features:
+            return list(map(tuple, np.array(points).astype(int)))
         
         # 设置默认特征权重
         if feature_weights is None:
@@ -380,7 +396,7 @@ class TerrainSegmenter:
 
         return image_array
 
-    def get_result(self, prompt_low_csv_path, predict_img_path, result_csv_path):
+    def get_result(self, prompt_low_csv_path, predict_img_path, result_csv_path, ablation=0, feature_ablation=None):
         """
         主函数，执行地物分割全流程。
         
@@ -408,9 +424,14 @@ class TerrainSegmenter:
             input_point = self.change_prompt_pixel_to_pic_pixel(points_from_prompt, prompt.shape, img.shape)
             if len(input_point) == 0:
                 continue
-            # 自适应采样优化提示点
-            result_index = self.find_pixel(input_point, image=img)
-            
+            # 自采样提示点：可通过 ablation 开关控制
+            if ablation == 1 or ablation == 2:
+                # 变体1：去除自采样，仅使用来自低分辨率映射的点
+                result_index = input_point
+            else:
+                # 默认与其他变体：执行基于特征的自采样
+                result_index = self.find_pixel(input_point, image=img, feature_ablation=feature_ablation)
+
             if len(result_index) > 0:
                 points = np.array(result_index)
                 input_label = np.ones(points.shape[0], dtype=int)  # 正样本标签
@@ -419,18 +440,95 @@ class TerrainSegmenter:
                 for mask, score in terrian_result:
                     classification_list.append([mask, score, key])
         
-        # 填充分类结果
-        self.fill_passible(image_array, classification_list)
+        # 填充分类结果，支持消融变体：
+        # ablation==0: 原始（层次化融合 + 自适应融合）
+        # ablation==1: 去自采样，去融合
+        # ablation==2: 去融合，采用 SAM 最大 score 作为像素分类结果
+        # ablation==3: 去自采样，采用 SAM 预测结果作为像素分类结果
+        if ablation == 0 or ablation == 2:
+            # 原始流程（层次化融合 + 自适应融合）
+            image_array = self.fill_passible(image_array, classification_list)
+        else:
+            # 采用 SAM 最大 score 作为当前点的地物分类结果（无融合）
+            if not classification_list:
+                image_array = image_array
+            else:
+                # 获取类列表并映射到索引
+                class_ids = sorted(list(set([c for _, _, c in classification_list])))
+                id2idx = {cid: i for i, cid in enumerate(class_ids)}
+                score_map = np.zeros((len(class_ids), img.shape[0], img.shape[1]), dtype=float)
+                for mask, score, cid in classification_list:
+                    idx = id2idx[cid]
+                    # mask assumed boolean or 0/1
+                    score_map[idx] = np.maximum(score_map[idx], mask.astype(float) * float(score))
+                winner = np.argmax(score_map, axis=0)
+                # map winner indices back to class ids
+                for i, cid in enumerate(class_ids):
+                    image_array[winner == i] = cid
         # 保存结果
         np.savetxt(result_csv_path, image_array, delimiter=',', fmt='%d')
 
 if __name__ == '__main__':
-    # 初始化地物分割器
+    '''# 初始化地物分割器
     terrain_segmenter = TerrainSegmenter()
     
     # 运行分割任务
     terrain_segmenter.get_result(
-        prompt_low_csv_path="data/test/prompt.csv", 
-        predict_img_path="data/test/pic.tif",
-        result_csv_path="data/test/result.csv"
+        prompt_low_csv_path="data/data6/prompt.csv", 
+        predict_img_path="data/data6/pic_resize.tif",
+        result_csv_path="data/result6/sam_update_segmentation.csv",ablation=0
+    )'''
+
+    parser = argparse.ArgumentParser(
+        description='Run TerrainSegmenter for a single dataset folder. Image is fixed to pic_resize.tif; prompt CSV is specified manually.'
     )
+    parser.add_argument('input_dir', help='Dataset folder path, e.g., data/data1')
+    parser.add_argument('--prompt_csv', required=True, help='Prompt CSV filename inside input_dir, e.g., prompt.csv or prompt_10.csv')
+    parser.add_argument('--output_csv', default='sam_update_segmentation.csv', help='Output CSV filename inside input_dir')
+    parser.add_argument('--ablation', '-a', type=int, default=0, help='Ablation mode passed to get_result')
+    parser.add_argument('--model_type', '-m', type=str, default='l', help='SAM model type to use (e.g., vit_l, vit_h)')
+    parser.add_argument('--drop_spectral', action='store_true', help='Ablation: drop spectral (RGB) features in feature-guided sampling')
+    parser.add_argument('--drop_ndvi', action='store_true', help='Ablation: drop NDVI feature in feature-guided sampling')
+    parser.add_argument('--drop_texture', action='store_true', help='Ablation: drop texture (LBP) feature in feature-guided sampling')
+    parser.add_argument('--drop_edges', action='store_true', help='Ablation: drop edge (Canny) feature in feature-guided sampling')
+    args = parser.parse_args()
+
+    input_dir = args.input_dir
+    ablation = args.ablation
+    model_type = args.model_type
+
+    feature_ablation = {
+        'drop_spectral': bool(args.drop_spectral),
+        'drop_ndvi': bool(args.drop_ndvi),
+        'drop_texture': bool(args.drop_texture),
+        'drop_edges': bool(args.drop_edges),
+    }
+
+    terrain_segmenter = None
+
+    if model_type == 'h':
+        terrain_segmenter = TerrainSegmenter(model_type="vit_h", checkpoint="sam_vit_h_4b8939.pth")
+    elif model_type == 'l':
+        terrain_segmenter = TerrainSegmenter(model_type="vit_l", checkpoint="sam_vit_l_0b3195.pth")
+
+    prompt_path = os.path.join(input_dir, args.prompt_csv)
+    tif_path = os.path.join(input_dir, 'pic_resize.tif')
+    out_path = os.path.join(input_dir, args.output_csv)
+
+    if not os.path.isdir(input_dir):
+        raise FileNotFoundError(f"input_dir not found: {input_dir}")
+    if not os.path.exists(prompt_path):
+        raise FileNotFoundError(f"prompt_csv not found: {prompt_path}")
+    if not os.path.exists(tif_path):
+        raise FileNotFoundError(f"pic_resize.tif not found: {tif_path}")
+
+    print(f"Processing prompt={prompt_path}, image={tif_path} -> out={out_path}")
+    terrain_segmenter.get_result(
+        prompt_low_csv_path=prompt_path,
+        predict_img_path=tif_path,
+        result_csv_path=out_path,
+        ablation=ablation,
+        feature_ablation=feature_ablation
+    )
+
+    print("Done.")
